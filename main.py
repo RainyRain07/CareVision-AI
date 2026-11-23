@@ -29,41 +29,105 @@ def parse_json(text: str):
         raise HTTPException(502, "AI ส่งผลลัพธ์ไม่เป็น JSON กรุณาลองอีกครั้ง") from exc
 
 
+
 async def ask_ai(client, image, mime, instruction):
     import base64
+
     key = os.getenv("GEMINI_API_KEY", "").strip()
-    if not key or key == "ใส่_API_KEY_ของคุณ":
-        raise HTTPException(503, "ยังไม่ได้ตั้งค่า GEMINI_API_KEY ในไฟล์ .env")
-    primary = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite").strip().removeprefix("models/")
-    fallback = os.getenv("GEMINI_FALLBACK_MODEL", "gemini-3.8-flash").strip().removeprefix("models/")
+    if not key:
+        raise HTTPException(503, "ยังไม่ได้ตั้งค่า Gemini API Key")
+
+    primary = os.getenv(
+        "GEMINI_MODEL", "gemini-2.5-flash"
+    ).strip().removeprefix("models/")
+
+    fallback = os.getenv(
+        "GEMINI_FALLBACK_MODEL", "gemini-2.5-flash-lite"
+    ).strip().removeprefix("models/")
+
     models = list(dict.fromkeys([primary, fallback]))
+
     payload = {
-        "contents": [{"parts": [
-            {"text": instruction},
-            {"inline_data": {"mime_type": mime, "data": base64.b64encode(image).decode("ascii")}}
-        ]}],
-        "generationConfig": {"temperature": 0, "responseMimeType": "application/json"}
+        "contents": [{
+            "parts": [
+                {"text": instruction},
+                {
+                    "inline_data": {
+                        "mime_type": mime,
+                        "data": base64.b64encode(image).decode("ascii")
+                    }
+                }
+            ]
+        }],
+        "generationConfig": {
+            "temperature": 0,
+            "responseMimeType": "application/json"
+        }
     }
-    last = "ไม่สามารถติดต่อโมเดลได้"
+
+    errors = []
+
     for model in models:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+        url = (
+            "https://generativelanguage.googleapis.com"
+            f"/v1beta/models/{model}:generateContent"
+        )
+
         for attempt in range(3):
             try:
-                response = await client.post(url, headers={"x-goog-api-key": key}, json=payload)
+                response = await client.post(
+                    url,
+                    headers={"x-goog-api-key": key},
+                    json=payload
+                )
+
                 if response.status_code == 200:
-                    data = response.json()
-                    parts = data["candidates"][0]["content"]["parts"]
-                    return parse_json("".join(p.get("text", "") for p in parts))
-                last = f"{model}: HTTP {response.status_code}"
-                print("Gemini error:", last, flush=True)
-                if response.status_code not in (429, 500, 502, 503, 504):
+                    result = response.json()
+                    parts = result["candidates"][0]["content"]["parts"]
+                    output = "".join(
+                        part.get("text", "") for part in parts
+                    )
+                    return parse_json(output)
+
+                try:
+                    detail = response.json().get("error", {}).get(
+                        "message", response.text[:300]
+                    )
+                except ValueError:
+                    detail = response.text[:300]
+
+                error = f"{model}: HTTP {response.status_code}: {detail}"
+                print("Gemini error:", error, flush=True)
+
+                if response.status_code not in (
+                    429, 500, 502, 503, 504
+                ):
+                    errors.append(error)
                     break
-            except (httpx.RequestError, ValueError, KeyError, IndexError) as exc:
-                last = f"{model}: {type(exc).__name__}"
-                print("Gemini error:", last, flush=True)
+
+                if attempt == 2:
+                    errors.append(error)
+
+            except httpx.RequestError as exc:
+                error = f"{model}: {type(exc).__name__}"
+                print("Gemini network error:", error, flush=True)
+
+                if attempt == 2:
+                    errors.append(error)
+
+            except (ValueError, KeyError, IndexError) as exc:
+                error = f"{model}: invalid response ({type(exc).__name__})"
+                print("Gemini response error:", error, flush=True)
+                errors.append(error)
+                break
+
             if attempt < 2:
                 await asyncio.sleep(2 ** (attempt + 1))
-    raise HTTPException(502, f"AI ไม่สำเร็จ: {last} กรุณาลองใหม่")
+
+    raise HTTPException(
+        502,
+        "AI ไม่สำเร็จ กรุณาตรวจสอบ Render Logs"
+    )
 
 
 @app.get("/")
